@@ -1,3 +1,4 @@
+import os
 import cv2
 import mediapipe as mp
 import spotipy
@@ -5,6 +6,7 @@ from spotipy.oauth2 import SpotifyOAuth
 import time
 import requests
 import numpy as np
+from dotenv import load_dotenv
 
 # --------------------------
 # MediaPipe Hands
@@ -43,10 +45,11 @@ cv2.resizeWindow("Hand Tracking", 1280, 800)
 # --------------------------
 # Spotify client
 # --------------------------
-# (Consider env vars for security in a real project)
-CLIENT_ID = 'aba0a76ca1a745828758cdd4d01e06a9'
-CLIENT_SECRET = 'f2110e6458494e699d9688a7080b5cdb'
-REDIRECT_URI = 'http://localhost:8888/callback'
+load_dotenv()
+
+CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
+CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
+REDIRECT_URI = os.getenv("SPOTIPY_REDIRECT_URI")
 
 sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
     client_id=CLIENT_ID,
