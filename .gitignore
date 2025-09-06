@@ -1,0 +1,16 @@
+# Python virtual environment
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code settings
+.vscode/
+
+# OS files
+.DS_Store
+
+# Cache
+.cache/
