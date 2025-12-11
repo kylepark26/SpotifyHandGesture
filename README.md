@@ -1,14 +1,16 @@
 # BMWSpotifyIntegration
 
-Hand-gesture Spotify controller using **OpenCV**, **MediaPipe Hands**, and **Spotipy**.  
+Hand-gesture Spotify controller using **OpenCV**, **MediaPipe Hands**, and **Spotify Web API**.  
 Control playback with your webcam:
-- **Open palm (2s)** → Pause/Play
-- **Hold index fingertip at left edge (0.5s)** → Previous track
-- **Hold index fingertip at right edge (0.5s)** → Next track
+- **Open palm (1.5s)** → Pause/Play
+- **Hold two fingers up (1.5s)** → Volume UP
+- **Hold two fingers down (1.5s)** → Volume DOWN
+- **Hold two fingers right (1.5s)** → Next Track
+- **Hold two fingers left (1.5s)** → Previous Track
 - Overlay shows album art, title/artist, and a progress bar
 
 ## Features
-- Robust edge-dwell gestures tolerant to low FPS cameras
+- Robust gestures tolerant to low FPS cameras
 - Compact Spotify-style overlay (album cover, metadata, progress dot)
 - macOS-friendly camera selection (avoids Continuity Camera by default)
 
