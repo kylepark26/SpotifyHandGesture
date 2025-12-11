@@ -14,3 +14,7 @@ __pycache__/
 
 # Cache
 .cache/
+.env
+
+# Test files with credentials
+spotify_test.py
