@@ -8,24 +8,19 @@ import requests
 import numpy as np
 from dotenv import load_dotenv
 
-# --------------------------
-# MediaPipe Hands
-# --------------------------
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=1,
-    min_detection_confidence=0.6,
-    min_tracking_confidence=0.6
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
+    model_complexity=0
 )
 
-# --------------------------
-# OpenCV Camera (prefer Mac cam, not Continuity) + make it lighter
-# --------------------------
-cap = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
+cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
 if not cap.isOpened():
-    for idx in (0, 2, 3):
+    for idx in (1, 2, 3):
         cap.release()
         cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
         if cap.isOpened():
@@ -33,18 +28,13 @@ if not cap.isOpened():
     if not cap.isOpened():
         raise RuntimeError("Could not open a camera. Disable Continuity Camera or try other indices.")
 
-# Lower res for higher FPS (best-effort)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)   # try 1920 for 1080p if your FPS is ok
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-cap.set(cv2.CAP_PROP_FPS, 30)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+cap.set(cv2.CAP_PROP_FPS, 60)
 
-# Make the display window resizable and set an initial big size
 cv2.namedWindow("Hand Tracking", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Hand Tracking", 1280, 800)
 
-# --------------------------
-# Spotify client
-# --------------------------
 load_dotenv()
 
 CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
@@ -69,24 +59,33 @@ def prefer_desktop_device_once():
 
 prefer_desktop_device_once()
 
-# --------------------------
-# Gestures: open-palm pause/play + dwell-at-edges for prev/next
-# --------------------------
+HOLD_TIME = 1.5
 music_paused = False
-palm_open_time = 0.0            # start time when palm is detected
-
-DWELL_REQUIRED = 0.50           # seconds to hold at edge to trigger
-ACTION_COOLDOWN = 1.00          # seconds between prev/next actions
+palm_hold_start = 0.0
+two_finger_left_start = 0.0
+two_finger_right_start = 0.0
+two_finger_up_start = 0.0
+two_finger_down_start = 0.0
+current_volume = 50
 last_action_time = 0.0
+ACTION_COOLDOWN = 2.0
 
-EDGE_FRAC = 0.18                # left/right edge width as fraction of frame width
-current_zone = None             # 'L', 'R', or None
-zone_entry_time = 0.0
+frame_count = 0
+spotify_info_cache = (None, None, None, None, None)
+last_spotify_update = 0.0
+SPOTIFY_UPDATE_INTERVAL = 1.0
+cached_album_cover = None
+last_track_id = None
 
-SHOW_ZONES = False              # set True to visualize the dwell zones
+fps_start_time = time.time()
+fps_frame_count = 0
+current_fps = 0
+
+last_gesture = ""
+gesture_display_time = 0.0
+GESTURE_DISPLAY_DURATION = 1.5
 
 def is_palm_open(hand_landmarks):
-    """Simple open-palm heuristic based on wrist-to-fingertip distances."""
     wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
     thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
     index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
@@ -106,195 +105,324 @@ def is_palm_open(hand_landmarks):
         d(wrist, pinky_tip) > threshold
     ])
 
-def which_zone(x_px, w):
-    """Return 'L' if in left edge, 'R' if in right edge, else None."""
-    left_limit = int(w * EDGE_FRAC)
-    right_limit = int(w * (1.0 - EDGE_FRAC))
-    if x_px <= left_limit:
-        return 'L'
-    if x_px >= right_limit:
-        return 'R'
+def is_two_fingers_extended(hand_landmarks):
+    wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+    index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+    middle_tip = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+    ring_tip = hand_landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_TIP]
+    pinky_tip = hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_TIP]
+    ring_mcp = hand_landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_MCP]
+    pinky_mcp = hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_MCP]
+
+    def d(a, b):
+        return np.hypot(a.x - b.x, a.y - b.y)
+
+    index_extended = d(wrist, index_tip) > 0.20
+    middle_extended = d(wrist, middle_tip) > 0.20
+    ring_curled = d(ring_tip, ring_mcp) < 0.15
+    pinky_curled = d(pinky_tip, pinky_mcp) < 0.15
+
+    return index_extended and middle_extended and ring_curled and pinky_curled
+
+def get_two_finger_direction(hand_landmarks, frame_width, frame_height):
+    if not is_two_fingers_extended(hand_landmarks):
+        return None
+
+    index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+    middle_tip = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+
+    avg_x = (index_tip.x + middle_tip.x) / 2
+    avg_y = (index_tip.y + middle_tip.y) / 2
+
+    LEFT_ZONE = 0.25
+    RIGHT_ZONE = 0.75
+    UP_ZONE = 0.30
+    DOWN_ZONE = 0.70
+
+    if avg_x < LEFT_ZONE:
+        return 'left'
+    elif avg_x > RIGHT_ZONE:
+        return 'right'
+    elif avg_y < UP_ZONE:
+        return 'up'
+    elif avg_y > DOWN_ZONE:
+        return 'down'
+
     return None
 
-# --------------------------
-# Spotify helpers
-# --------------------------
 def get_current_song_info():
-    """Return (title, artist, album_cover_bgr, progress_ms, duration_ms)."""
+    global cached_album_cover, last_track_id
+
     current = sp.current_playback()
     if current and current.get('item'):
         track = current['item']
+        track_id = track['id']
         title = track['name']
         artist = ', '.join([a['name'] for a in track['artists']])
         duration_ms = track['duration_ms']
         progress_ms = current.get('progress_ms', 0)
 
-        # Album cover
-        cover = None
-        try:
-            album_cover_url = track['album']['images'][0]['url']
-            response = requests.get(album_cover_url, timeout=2.0)
-            arr = np.asarray(bytearray(response.content), dtype=np.uint8)
-            cover = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
-        except Exception:
-            pass
+        if track_id != last_track_id:
+            try:
+                album_cover_url = track['album']['images'][0]['url']
+                response = requests.get(album_cover_url, timeout=1.0)
+                arr = np.asarray(bytearray(response.content), dtype=np.uint8)
+                cached_album_cover = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                last_track_id = track_id
+            except Exception:
+                pass
 
-        return title, artist, cover, progress_ms, duration_ms
+        return title, artist, cached_album_cover, progress_ms, duration_ms
     return None, None, None, None, None
 
-# --------------------------
-# UI drawing (top-right panel)
-# --------------------------
 def draw_top_left_panel(frame, title, artist, album_cover, progress_ms, duration_ms):
-    """
-    Draw a compact Spotify-like panel in the top-left:
-    - semi-transparent background
-    - 140x140 album cover
-    - title + artist
-    - progress bar
-    """
     h, w = frame.shape[:2]
-    panel_w, panel_h = 360, 170
-    x0 = 12                 # <-- left margin
-    y0 = 12                 # <-- top margin
-    x1 = x0 + panel_w
-    y1 = y0 + panel_h
 
-    # translucent background
+    cover_size = 100
+    panel_w = 320
+    panel_h = cover_size + 40
+    margin = 15
+    x0, y0 = margin, margin
+    x1, y1 = x0 + panel_w, y0 + panel_h
+
+    SPOTIFY_BLACK = (18, 18, 18)
+    SPOTIFY_GREEN = (84, 185, 29)
+    TEXT_WHITE = (255, 255, 255)
+    TEXT_GRAY = (179, 179, 179)
+    PROGRESS_BG = (64, 64, 64)
+
     overlay = frame.copy()
-    cv2.rectangle(overlay, (x0, y0), (x1, y1), (30, 30, 30), thickness=-1)
-    cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), SPOTIFY_BLACK, -1)
+    cv2.addWeighted(overlay, 0.90, frame, 0.10, 0, frame)
 
-    # album cover
-    cover_size = 140
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (50, 50, 50), 1)
+
+    cover_x = x0 + 15
+    cover_y = y0 + 15
+
     if album_cover is not None:
         ac = cv2.resize(album_cover, (cover_size, cover_size))
-        frame[y0+10:y0+10+cover_size, x0+10:x0+10+cover_size] = ac
+        frame[cover_y:cover_y+cover_size, cover_x:cover_x+cover_size] = ac
+        cv2.rectangle(frame, (cover_x, cover_y),
+                     (cover_x+cover_size, cover_y+cover_size), (80, 80, 80), 1)
 
-    # text
-    text_x = x0 + 10 + cover_size + 12
-    text_y = y0 + 35
+    text_x = cover_x + cover_size + 15
+    text_max_width = x1 - text_x - 15
+    text_y_base = cover_y + 30
+
     if title:
-        cv2.putText(frame, title[:28], (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-        text_y += 28
+        avg_char_width = 8
+        max_chars = int(text_max_width / avg_char_width)
+        title_short = title[:max_chars-3] + "..." if len(title) > max_chars else title
+        cv2.putText(frame, title_short, (text_x, text_y_base),
+                   cv2.FONT_HERSHEY_PLAIN, 1.3, TEXT_WHITE, 2, cv2.LINE_AA)
+
     if artist:
-        cv2.putText(frame, artist[:32], (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1, cv2.LINE_AA)
+        avg_char_width = 7
+        max_chars = int(text_max_width / avg_char_width)
+        artist_short = artist[:max_chars-3] + "..." if len(artist) > max_chars else artist
+        cv2.putText(frame, artist_short, (text_x, text_y_base + 25),
+                   cv2.FONT_HERSHEY_PLAIN, 1.1, TEXT_GRAY, 1, cv2.LINE_AA)
 
-    # progress bar
-    bar_x0 = x0 + 10
-    bar_x1 = x1 - 10
-    bar_y  = y0 + panel_h - 20
-    cv2.line(frame, (bar_x0, bar_y), (bar_x1, bar_y), (160,160,160), 3, cv2.LINE_AA)
+    bar_y = cover_y + cover_size + 12
+    bar_x0 = x0 + 15
+    bar_x1 = x1 - 15
+    bar_height = 3
 
-    if progress_ms is not None and duration_ms:
+    cv2.rectangle(frame, (bar_x0, bar_y - bar_height//2),
+                 (bar_x1, bar_y + bar_height//2), PROGRESS_BG, -1, cv2.LINE_AA)
+
+    if progress_ms is not None and duration_ms and duration_ms > 0:
         frac = max(0.0, min(1.0, progress_ms / float(duration_ms)))
-        dot_x = int(bar_x0 + frac * (bar_x1 - bar_x0))
-        cv2.circle(frame, (dot_x, bar_y), 6, (255,255,255), -1, cv2.LINE_AA)
+        progress_x = int(bar_x0 + frac * (bar_x1 - bar_x0))
 
-        # timestamps (mm:ss)
+        cv2.rectangle(frame, (bar_x0, bar_y - bar_height//2),
+                     (progress_x, bar_y + bar_height//2), SPOTIFY_GREEN, -1, cv2.LINE_AA)
+
+        cv2.circle(frame, (progress_x, bar_y), 4, TEXT_WHITE, -1, cv2.LINE_AA)
+
         def mmss(ms):
             s = int(ms/1000)
             return f"{s//60}:{s%60:02d}"
-        cv2.putText(frame, mmss(progress_ms), (bar_x0, bar_y-8), cv2.FONT_HERSHEY_PLAIN, 1.0, (220,220,220), 1, cv2.LINE_AA)
-        cv2.putText(frame, mmss(duration_ms), (bar_x1-40, bar_y-8), cv2.FONT_HERSHEY_PLAIN, 1.0, (220,220,220), 1, cv2.LINE_AA)
 
-def draw_edge_guides(frame):
-    """Optional: visualize left/right dwell zones."""
-    if not SHOW_ZONES:
-        return
-    h, w = frame.shape[:2]
-    left_limit = int(w * EDGE_FRAC)
-    right_limit = int(w * (1.0 - EDGE_FRAC))
-    cv2.rectangle(frame, (0, 0), (left_limit, h), (0, 255, 0), 2)
-    cv2.rectangle(frame, (right_limit, 0), (w-1, h), (0, 255, 0), 2)
+        cv2.putText(frame, mmss(progress_ms), (bar_x0, bar_y + 15),
+                   cv2.FONT_HERSHEY_PLAIN, 0.9, TEXT_GRAY, 1, cv2.LINE_AA)
 
-# --------------------------
-# Main loop
-# --------------------------
+        duration_text = mmss(duration_ms)
+        duration_size = cv2.getTextSize(duration_text, cv2.FONT_HERSHEY_PLAIN, 0.9, 1)[0]
+        cv2.putText(frame, duration_text, (bar_x1 - duration_size[0], bar_y + 15),
+                   cv2.FONT_HERSHEY_PLAIN, 0.9, TEXT_GRAY, 1, cv2.LINE_AA)
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
-    frame = cv2.flip(frame, 1)  # mirror for natural interaction
+    frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb)
 
     h, w = frame.shape[:2]
-    draw_edge_guides(frame)
 
     if results.multi_hand_landmarks:
         for lm in results.multi_hand_landmarks:
             mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
 
-            # ----- Pause/Play: open palm for 2s -----
+            now = time.time()
+
             if is_palm_open(lm):
-                if palm_open_time == 0.0:
-                    palm_open_time = time.time()
-                elif time.time() - palm_open_time >= 2.0:
+                if palm_hold_start == 0.0:
+                    palm_hold_start = now
+                elif now - palm_hold_start >= HOLD_TIME and now - last_action_time >= ACTION_COOLDOWN:
                     current = sp.current_playback()
                     if current:
                         is_playing = current.get('is_playing')
                         if is_playing:
-                            if not music_paused:
-                                print("Palm 2s → Pause")
-                                sp.pause_playback()
-                                music_paused = True
+                            print("PAUSE")
+                            last_gesture = "PAUSE"
+                            gesture_display_time = now
+                            sp.pause_playback()
+                            music_paused = True
                         else:
-                            if music_paused:
-                                print("Palm 2s → Play")
-                                sp.start_playback()
-                                music_paused = False
-                    palm_open_time = 0.0
+                            print("PLAY")
+                            last_gesture = "PLAY"
+                            gesture_display_time = now
+                            sp.start_playback()
+                            music_paused = False
+                    palm_hold_start = 0.0
+                    last_action_time = now
             else:
-                palm_open_time = 0.0
+                palm_hold_start = 0.0
 
-            # ----- Prev/Next: dwell at left/right edge for 0.5s -----
-            idx_tip = lm.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-            x_px = int(idx_tip.x * w)
-            zone = which_zone(x_px, w)
-            now = time.time()
+            direction = get_two_finger_direction(lm, w, h)
 
-            if zone is None:
-                # left the edge → reset
-                current_zone = None
-                zone_entry_time = 0.0
+            if direction == 'left':
+                if two_finger_left_start == 0.0:
+                    two_finger_left_start = now
+                elif now - two_finger_left_start >= HOLD_TIME and now - last_action_time >= ACTION_COOLDOWN:
+                    print("PREVIOUS TRACK")
+                    last_gesture = "PREVIOUS"
+                    gesture_display_time = now
+                    try:
+                        sp.previous_track()
+                    except Exception as e:
+                        print(f"Error: {e}")
+                    two_finger_left_start = 0.0
+                    last_action_time = now
             else:
-                # entered an edge zone
-                if current_zone != zone:
-                    current_zone = zone
-                    zone_entry_time = now
-                else:
-                    # staying in same zone → check dwell time and cooldown
-                    if (now - zone_entry_time >= DWELL_REQUIRED) and (now - last_action_time >= ACTION_COOLDOWN):
-                        if current_zone == 'L':
-                            print("Dwell LEFT 0.5s → Previous track")
-                            try:
-                                sp.previous_track()
-                            except Exception:
-                                pass
-                        elif current_zone == 'R':
-                            print("Dwell RIGHT 0.5s → Next track")
-                            try:
-                                sp.next_track()
-                            except Exception:
-                                pass
-                        last_action_time = now
-                        # require leaving the zone before another trigger
-                        current_zone = None
-                        zone_entry_time = 0.0
+                two_finger_left_start = 0.0
+
+            if direction == 'right':
+                if two_finger_right_start == 0.0:
+                    two_finger_right_start = now
+                elif now - two_finger_right_start >= HOLD_TIME and now - last_action_time >= ACTION_COOLDOWN:
+                    print("NEXT TRACK")
+                    last_gesture = "NEXT"
+                    gesture_display_time = now
+                    try:
+                        sp.next_track()
+                    except Exception as e:
+                        print(f"Error: {e}")
+                    two_finger_right_start = 0.0
+                    last_action_time = now
+            else:
+                two_finger_right_start = 0.0
+
+            if direction == 'up':
+                if two_finger_up_start == 0.0:
+                    two_finger_up_start = now
+                elif now - two_finger_up_start >= HOLD_TIME and now - last_action_time >= ACTION_COOLDOWN:
+                    current_volume = min(100, current_volume + 10)
+                    print(f"Volume UP to {current_volume}%")
+                    last_gesture = f"VOL {current_volume}%"
+                    gesture_display_time = now
+                    try:
+                        sp.volume(current_volume)
+                    except Exception as e:
+                        print(f"Volume error: {e}")
+                    two_finger_up_start = 0.0
+                    last_action_time = now
+            else:
+                two_finger_up_start = 0.0
+
+            if direction == 'down':
+                if two_finger_down_start == 0.0:
+                    two_finger_down_start = now
+                elif now - two_finger_down_start >= HOLD_TIME and now - last_action_time >= ACTION_COOLDOWN:
+                    current_volume = max(0, current_volume - 10)
+                    print(f"Volume DOWN to {current_volume}%")
+                    last_gesture = f"VOL {current_volume}%"
+                    gesture_display_time = now
+                    try:
+                        sp.volume(current_volume)
+                    except Exception as e:
+                        print(f"Volume error: {e}")
+                    two_finger_down_start = 0.0
+                    last_action_time = now
+            else:
+                two_finger_down_start = 0.0
+
     else:
-        # No hand → reset timers/state
-        palm_open_time = 0.0
-        current_zone = None
-        zone_entry_time = 0.0
+        palm_hold_start = 0.0
+        two_finger_left_start = 0.0
+        two_finger_right_start = 0.0
+        two_finger_up_start = 0.0
+        two_finger_down_start = 0.0
 
-    # ----- Spotify-like panel (top-right) -----
-    title, artist, album_cover, progress_ms, duration_ms = get_current_song_info()
+    fps_frame_count += 1
+    if time.time() - fps_start_time >= 1.0:
+        current_fps = fps_frame_count
+        fps_frame_count = 0
+        fps_start_time = time.time()
+
+    now = time.time()
+    if now - last_spotify_update >= SPOTIFY_UPDATE_INTERVAL:
+        spotify_info_cache = get_current_song_info()
+        last_spotify_update = now
+
+    title, artist, album_cover, progress_ms, duration_ms = spotify_info_cache
     draw_top_left_panel(frame, title, artist, album_cover, progress_ms, duration_ms)
 
+    fps_text = f"{current_fps} FPS"
+    fps_size = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+    fps_x = frame.shape[1] - fps_size[0] - 15
+    fps_y = frame.shape[0] - 15
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (fps_x - 8, fps_y - fps_size[1] - 8),
+                 (fps_x + fps_size[0] + 8, fps_y + 8), (18, 18, 18), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+    cv2.putText(frame, fps_text, (fps_x, fps_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1, cv2.LINE_AA)
+
+    if last_gesture and (time.time() - gesture_display_time < GESTURE_DISPLAY_DURATION):
+        h, w = frame.shape[:2]
+
+        font_scale = 2.5
+        text_size = cv2.getTextSize(last_gesture, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 4)[0]
+        text_x = (w - text_size[0]) // 2
+        text_y = (h + text_size[1]) // 2
+
+        overlay = frame.copy()
+        padding = 40
+        bg_x0 = text_x - padding
+        bg_y0 = text_y - text_size[1] - padding
+        bg_x1 = text_x + text_size[0] + padding
+        bg_y1 = text_y + padding
+
+        cv2.rectangle(overlay, (bg_x0, bg_y0), (bg_x1, bg_y1), (18, 18, 18), -1)
+        cv2.addWeighted(overlay, 0.9, frame, 0.1, 0, frame)
+
+        cv2.rectangle(frame, (bg_x0, bg_y0), (bg_x1, bg_y1), (84, 185, 29), 2)
+
+        cv2.putText(frame, last_gesture, (text_x + 2, text_y + 2),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (84, 185, 29), 4, cv2.LINE_AA)
+        cv2.putText(frame, last_gesture, (text_x, text_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 4, cv2.LINE_AA)
+
     cv2.imshow("Hand Tracking", frame)
-    if cv2.waitKey(1) & 0xFF in (27, ord('q')):  # ESC or q
+    if cv2.waitKey(1) & 0xFF in (27, ord('q')):
         break
 
 cap.release()
